@@ -75,7 +75,7 @@ typedef enum _SYSTEM_INFORMATION_CLASS {
 } SYSTEM_INFORMATION_CLASS;
 
 
-typedef DWORD NTSTATUS;
+typedef _Return_type_success_(return >= 0) LONG NTSTATUS;
 NTSTATUS WINAPI NtQuerySystemInformation (
         SYSTEM_INFORMATION_CLASS   SystemInformationClass,
         PVOID                      SystemInformation,
